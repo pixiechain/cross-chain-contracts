@@ -1,0 +1,31 @@
+# dependencies
+/node_modules
+
+# misc
+.DS_Store
+.env.*
+
+# IDE
+/.idea
+
+# builders
+/artifacts
+/cache
+/typechain-types
+/dist
+
+/conf_dev
+/conf_mainnet
+/conf_testnet
+/keystore_dev
+/keystore_testnet
+/keystore_mainnet
+/keystore
+
+/*.tar
+/*.tar.gz
+
+/git.json
+
+.deps
+artifacts

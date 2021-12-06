@@ -1,0 +1,451 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+import {ERC721Burnable} from "./ERC721Burnable.sol";
+import {ERC721} from "./ERC721.sol";
+import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
+import {SafeMath} from "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import {Decimal} from "./Decimal.sol";
+import "./interfaces/IMedia.sol";
+
+/**
+ * @title A media value system, with perpetual equity to creators
+ * @notice This contract provides an interface to mint Pixie media.
+ */
+contract Media is IMedia, ERC721Burnable, ReentrancyGuard {
+    using SafeMath for uint256;
+    using EnumerableSet for EnumerableSet.UintSet;
+
+    /* *******
+     * Globals
+     * *******
+     */
+
+    // To record the contract creator address
+    address private _contractCreator;
+
+    // Mapping from token id to creator address
+    mapping(uint256 => address) public tokenCreators;
+
+    // Mapping from creator address to their (enumerable) set of created tokens
+    mapping(address => EnumerableSet.UintSet) private _creatorTokens;
+
+    // Mapping from token id to sha256 hash of content
+    mapping(uint256 => bytes32) public tokenContentHashes;
+
+    // Mapping from contentHash to tokenID
+    struct tokenID {
+        uint256 value;
+        bool isValid;
+    }
+    mapping(bytes32 => tokenID) private _contentHashes;
+
+    //keccak256("Permit(address spender,uint256 tokenId,uint256 nonce,uint256 deadline)");
+    bytes32 public constant PERMIT_TYPEHASH =
+        0x49ecf333e5b8c95c40fdafc95c1ad136e8914a8fb55e9dc8bb01eaa83a2df9ad;
+
+    //keccak256("MintWithSig(bytes32 contentHash,uint256 nonce,uint256 deadline)");
+    bytes32 public constant MINT_WITH_SIG_TYPEHASH =
+        0x7540a87a6f5a3ca71228cbcf292e92bad63a56d2f56ffabd2c53ec29c9f4671f;
+
+    // Mapping from address to token id to permit nonce
+    mapping(address => mapping(uint256 => uint256)) public permitNonces;
+
+    // Mapping from address to mint with sig nonce
+    mapping(address => uint256) public mintWithSigNonces;
+
+    // Finalization state, only false can permit mint
+    bool public finalization = false;
+
+    /* *********
+     * Modifiers
+     * *********
+     */
+
+    /**
+     * @notice Require that the token has not been burned and has been minted
+     */
+    modifier onlyExistingToken(uint256 tokenId) {
+        require(_exists(tokenId), "Media: nonexistent token");
+        _;
+    }
+
+    /**
+     * @notice Require that the token has had a content hash set
+     */
+    modifier onlyTokenWithContentHash(uint256 tokenId) {
+        require(
+            tokenContentHashes[tokenId] != 0,
+            "Media: token does not have hash of created content"
+        );
+        _;
+    }
+    
+    /**
+     * @notice Ensure that the provided spender is the approved or the owner of
+     * the media for the specified tokenId
+     */
+    modifier onlyApprovedOrOwner(address spender, uint256 tokenId) {
+        require(
+            _isApprovedOrOwner(spender, tokenId),
+            "Media: Only approved or owner"
+        );
+        _;
+    }
+
+    /**
+     * @notice Ensure that the provided URI is not empty
+     */
+    modifier onlyValidURI(string memory uri) {
+        require(
+            bytes(uri).length != 0,
+            "Media: specified uri must be non-empty"
+        );
+        _;
+    }
+
+    /**
+     * @notice Ensure that the collection of this contract is finalization, and can not mint any more.
+     */
+    modifier onlyMintAvailable() {
+        require(finalization == false, "Media: mint function is not available.");
+        _;
+    }
+
+    /**
+     * @notice On deployment, set the media name and symbol
+     */
+    constructor(string memory n, string memory s) ERC721(n, s) {
+       _contractCreator = address(0);
+    }
+
+    /**
+     * @notice Sets the contract creator address. This address is the only permitted address that
+     * can call the mutable functions. This method can only be called once.
+     */
+    function configure(address creator) external {
+        require(_contractCreator == address(0), "Media: creator already configured");
+        require(creator != address(0), "Media: cannot set creator as zero address");
+        _contractCreator = creator;
+    }
+
+    /* **************
+     * View Functions
+     * **************
+     */
+
+    /**
+     * @notice return the URI for a particular piece of media with the specified tokenId
+     * @dev This function is an override of the base OZ implementation because we
+     * will return the tokenURI even if the media has been burned. In addition, this
+     * protocol does not support a base URI, so relevant conditionals are removed.
+     * @return the URI for a token
+     */
+    function tokenURI(uint256 tokenId) public view override
+        onlyExistingToken(tokenId)
+        returns (string memory)
+    {
+        return _tokenURIs[tokenId];
+    }
+
+    /**
+     * @notice get the tokenId given the content_hash if the token has been minted
+     * @return the tokenId of the token
+     */
+    function getTokenIdByContentHash(bytes32 contentHash) public view returns (uint256)
+    {
+        require(
+            _contentHashes[contentHash].isValid == true,
+            "This token has not been minted."
+        );
+        return _contentHashes[contentHash].value;
+    }
+
+
+    /* ****************
+     * Public Functions
+     * ****************
+     */
+
+    /**
+     * @notice Burn a token.
+     * @dev Only allowed to be burned in the original chain.
+     */
+    function burn(uint256 tokenId) public override
+        nonReentrant
+        onlyExistingToken(tokenId)
+        onlyApprovedOrOwner(msg.sender, tokenId)
+    {
+        require(false, "Media: only allowed to be burned in the original chain");
+    }
+
+    /**
+     * @dev Calculates EIP712 DOMAIN_SEPARATOR based on the current contract and chain ID.
+     */
+    function _calculateDomainSeparator() public view returns (bytes32) {
+        uint256 chainID;
+        /* solium-disable-next-line */
+        assembly {
+            chainID := chainid()
+        }
+
+        return
+            keccak256(
+                abi.encode(
+                    keccak256(
+                        "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+                    ),
+                    keccak256(bytes("Pixie")),
+                    keccak256(bytes("1")),
+                    chainID,
+                    address(this)
+                )
+            );
+    }
+
+    function exists(uint256 tokenId) public view returns (bool) {
+        return _exists(tokenId);
+    }
+
+    function creatorOf(uint256 tokenId) public view returns (address) {
+        return tokenCreators[tokenId];
+    }
+
+    /* ****************
+     * External Functions
+     * ****************
+     */
+
+    /**
+     * @notice Mint new media with URI.
+     */
+    function mintWithURI(address to, uint256 tokenId, string memory uri) external {
+        require(msg.sender == _contractCreator, "Media: Only contract creator can mint");
+        require(
+            _exists(tokenId) == false,
+            "Media: existent tokenId"
+        );
+
+        _safeMint(to, tokenId);
+        _setTokenURI(tokenId, uri);
+        EnumerableSet.add(_creatorTokens[to], tokenId);
+        tokenCreators[tokenId] = to;
+    }
+
+    /**
+     * @notice see IMedia
+     */
+    //function mint(MediaData memory data, IMarket.BidShares memory bidShares)
+    function mint(uint256 tokenId, MediaData memory data) external override
+        nonReentrant
+    {
+        _mintForCreator(msg.sender, tokenId, data);
+    }
+
+    /**
+     * @notice see IMedia
+     */
+    function mintForCreator(address creator, uint256 tokenId, MediaData memory data) external override
+        nonReentrant
+    {
+        _mintForCreator(creator, tokenId, data);
+    }
+
+    /**
+     * @notice see IMedia
+     */
+    function mintWithSig(address creator, uint256 tokenId, MediaData memory data, EIP712Signature memory sig) external override
+        nonReentrant 
+    {
+        require(
+            sig.deadline == 0 || sig.deadline >= block.timestamp,
+            "Media: mintWithSig expired"
+        );
+
+        bytes32 domainSeparator = _calculateDomainSeparator();
+
+        bytes32 digest =
+            keccak256(
+                abi.encodePacked(
+                    "\x19\x01",
+                    domainSeparator,
+                    keccak256(
+                        abi.encode(
+                            MINT_WITH_SIG_TYPEHASH,
+                            data.contentHash,
+                            mintWithSigNonces[creator]++,
+                            sig.deadline
+                        )
+                    )
+                )
+            );
+
+        address recoveredAddress = ecrecover(digest, sig.v, sig.r, sig.s);
+
+        require(
+            recoveredAddress != address(0) && creator == recoveredAddress,
+            "Media: Signature invalid"
+        );
+
+        _mintForCreator(recoveredAddress, tokenId, data);
+    }
+
+    /**
+     * @notice Revoke the approvals for a token. The provided `approve` function is not sufficient
+     * for this protocol, as it does not allow an approved address to revoke it's own approval.
+     * In instances where a 3rd party is interacting on a user's behalf via `permit`, they should
+     * revoke their approval once their task is complete as a best practice.
+     */
+    function revokeApproval(uint256 tokenId) external override 
+        nonReentrant 
+    {
+        require(
+            msg.sender == getApproved(tokenId),
+            "Media: caller not approved address"
+        );
+        _approve(address(0), tokenId);
+    }
+
+    /**
+     * @notice see IMedia
+     * @dev only callable by approved or owner
+     */
+    function updateTokenURI(uint256 tokenId, string calldata _tokenURI) external override
+        nonReentrant
+        onlyApprovedOrOwner(msg.sender, tokenId)
+        onlyTokenWithContentHash(tokenId)
+        onlyValidURI(_tokenURI)
+    {
+        _setTokenURI(tokenId, _tokenURI);
+        emit TokenURIUpdated(tokenId, msg.sender, _tokenURI);
+    }
+
+    /**
+     * @notice See IMedia
+     * @dev This method is loosely based on the permit for ERC-20 tokens in  EIP-2612, but modified
+     * for ERC-721.
+     */
+    function permit(address spender, uint256 tokenId, EIP712Signature memory sig) external override 
+        nonReentrant 
+        onlyExistingToken(tokenId) 
+    {
+        require(
+            sig.deadline == 0 || sig.deadline >= block.timestamp,
+            "Media: Permit expired"
+        );
+        require(spender != address(0), "Media: spender cannot be 0x0");
+        bytes32 domainSeparator = _calculateDomainSeparator();
+
+        bytes32 digest =
+            keccak256(
+                abi.encodePacked(
+                    "\x19\x01",
+                    domainSeparator,
+                    keccak256(
+                        abi.encode(
+                            PERMIT_TYPEHASH,
+                            spender,
+                            tokenId,
+                            permitNonces[ownerOf(tokenId)][tokenId]++,
+                            sig.deadline
+                        )
+                    )
+                )
+            );
+
+        address recoveredAddress = ecrecover(digest, sig.v, sig.r, sig.s);
+
+        require(
+            recoveredAddress != address(0) &&
+                ownerOf(tokenId) == recoveredAddress,
+            "Media: Signature invalid"
+        );
+
+        _approve(spender, tokenId);
+    }
+
+    /**
+     * @notice See IMedia
+     */
+    function finalize() external override
+    {
+        require(msg.sender == _contractCreator, "Meida: Only contract creator can finalize supply");
+        require(finalization == false, "Meida: Already finalized");
+        finalization = true;
+    }
+
+    /* *****************
+     * Private Functions
+     * *****************
+     */
+
+    /**
+     * @notice Creates a new token for `creator`. Its token ID will be automatically
+     * assigned (and available on the emitted {IERC721-Transfer} event), and the token
+     * URI autogenerated based on the base URI passed at construction.
+     *
+     * See {ERC721-_safeMint}.
+     *
+     * On mint, also set the sha256 hashes of the content for integrity
+     * checks, along with the initial URIs to point to the content. Attribute
+     * the token ID to the creator, mark the content hash as used.
+     *
+     * Note that the content hash must be unique for future mints to prevent duplicate media.
+     */
+    function _mintForCreator(address creator, uint256 tokenId, MediaData memory data) internal 
+        onlyMintAvailable
+        onlyValidURI(data.tokenURI) 
+    {
+        require(msg.sender == _contractCreator, "Meida: Only contract creator can mint");
+        require(data.contentHash != 0, "Media: content hash must be non-zero");
+        require(
+            _contentHashes[data.contentHash].isValid == false,
+            "Media: a token has already been created with this content hash"
+        );
+        require(
+            _exists(tokenId) == false,
+            "Media: existent tokenId"
+        );
+
+        _safeMint(creator, tokenId);
+        _setTokenContentHash(tokenId, data.contentHash);
+        _setTokenURI(tokenId, data.tokenURI);
+        EnumerableSet.add(_creatorTokens[creator], tokenId);
+        _contentHashes[data.contentHash].value = tokenId;
+        _contentHashes[data.contentHash].isValid = true;
+
+        tokenCreators[tokenId] = creator;
+    }
+
+    function _setTokenContentHash(uint256 tokenId, bytes32 contentHash) internal virtual
+        onlyExistingToken(tokenId)
+    {
+        tokenContentHashes[tokenId] = contentHash;
+    }
+
+    /**
+     * @notice Destroys `tokenId`.
+     * @dev We modify the OZ _burn implementation to
+     * maintain metadata and to remove the
+     * previous token owner from the piece
+     */
+    function _burn(uint256 tokenId) internal override {
+        string memory _tokenURI = _tokenURIs[tokenId];
+
+        super._burn(tokenId);
+
+        if (bytes(_tokenURI).length != 0) {
+            _tokenURIs[tokenId] = _tokenURI;
+        }
+    }
+
+    /**
+     * @notice transfer a token and remove the ask for it.
+     */
+    function _transfer(address from, address to, uint256 tokenId) internal override {
+        super._transfer(from, to, tokenId);
+    }
+}
